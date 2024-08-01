@@ -114,7 +114,7 @@ def save_tif(arr, filename):
     filename : str
         tif format file name
     """
-    tf.imsave(filename.replace(os.sep, '/'), np.abs(arr).transpose().astype(np.float32))
+    tf.imsave(filename.replace(os.sep, '/'), np.abs(arr).transpose().astype(np.float64))
 
 
 def read_config(config):
