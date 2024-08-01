@@ -38,7 +38,8 @@ __docformat__ = 'restructuredtext en'
 __all__ = ['set_lib_from_pkg',
            'reconstruction',
            'Breeder',
-           'Rec']
+           'Rec',
+           'DataRec']
 
 
 def set_lib_from_pkg(pkg):
@@ -124,7 +125,7 @@ class Rec:
         self.need_save_data = False
         self.saved_data = None
         self.er_iter = False  # Indicates whether the last iteration done was ER, used in CoupledRec
-
+        self.progress_callback = None # Method called in progress_operation()
 
     def init_dev(self, device_id):
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -430,6 +431,14 @@ class Rec:
 
     def progress_operation(self):
         print(f'------iter {self.iter}   error {self.errs[-1]}')
+        if self.progress_callback:
+            images = self.get_rec_data()
+            self.progress_callback(images)
+
+    def get_rec_data(self):
+        ds_image, support = dvut.center_sync(self.ds_image, self.support)
+        image = np.abs(devlib.to_numpy(ds_image)).transpose()
+        return image
 
     def get_ratio(self, divident, divisor):
         ratio = devlib.where((divisor > 1e-9), divident / divisor, 0.0)
@@ -928,3 +937,50 @@ def reconstruction(datafile, **kwargs):
         save_dir, filename = os.path.split(datafile)
     if ret_code == 0:
         worker.save_res(save_dir)
+
+
+class DataRec(Rec):
+    """
+    Class that performs phasing using iterative algorithm, but gets data
+    directly (not through the data file).
+
+    params : dict
+        parameters used in reconstruction. Refer to x for parameters description
+    data: data array
+    pkg: library to be used for reconstruction
+    progress_callback: method to be called in progress_operation()
+    """
+    def __init__(self, params, data, pkg, progress_callback=None):
+        Rec.__init__(self, params, None, pkg)
+        self.data = data
+        self.progress_callback = progress_callback
+
+    def init_dev(self, device_id):
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        if device_id != -1:
+            self.dev = device_id
+            if device_id != -1:
+                try:
+                    devlib.set_device(device_id)
+                except Exception as e:
+                    print(e)
+                    print('may need to restart GUI')
+                    return -1
+
+        try:
+            data = devlib.from_numpy(self.data)
+        except Exception as e:
+            print(e)
+            return -1
+        # in the formatted data the max is in the center, we want it in the corner, so do fft shift
+        self.data = devlib.fftshift(devlib.absolute(data))
+        self.dims = devlib.dims(self.data)
+        print('data shape', self.dims)
+
+        if self.need_save_data:
+            self.saved_data = devlib.copy(self.data)
+            self.need_save_data = False
+
+        return 0
+
+
