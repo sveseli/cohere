@@ -19,7 +19,7 @@ import cohere_core.utilities.config_verifier as ver
 __author__ = "Barbara Frosik"
 __copyright__ = "Copyright (c) 2016, UChicago Argonne, LLC."
 __docformat__ = 'restructuredtext en'
-__all__ = ['prep',
+__all__ = ['prep', 'prep_data',
            ]
 
 
@@ -183,3 +183,123 @@ def prep(beamline_full_datafile_name, auto, **kwargs):
     if auto:
         kwargs['intensity_threshold'] = intensity_threshold
     return kwargs
+
+def prep_data(beam_data, **kwargs):
+    """
+    This function formats data for reconstruction. The preparation consists of the following steps:
+        - removing the alien: aliens are areas that are effect of interference. The area is manually set in a configuration file after inspecting the data. It could be also a mask file of the same dimensions that data. Another option is AutoAlien1 algorithm that automatically removes the aliens.
+        - clearing the noise: values below an amplitude threshold are set to zero
+        - amplitudes are set to sqrt
+        - cropping and padding. If the adjust_dimention is negative in any dimension, the array is cropped in this dimension. The cropping is followed by padding in the dimensions that have positive adjust dimension. After adjusting, the dimensions are adjusted further to find the smallest dimension that is supported by opencl library (multiplier of 2, 3, and 5).
+        - centering - finding the greatest amplitude and locating it at a center of array. If shift center is defined, the center will be shifted accordingly.
+        - binning - adding amplitudes of several consecutive points. Binning can be done in any dimension.
+
+    Parameters
+    ----------
+    beamline_full_datafile_name : str
+        full name of tif file containing beamline preprocessed data
+    kwargs : keyword arguments
+        data_dir : str
+            directory where prepared data will be saved, default <experiment_dir>/phasing_data
+        alien_alg : str
+            Name of method used to remove aliens. Possible options are: ‘block_aliens’, ‘alien_file’, and ‘AutoAlien1’. The ‘block_aliens’ algorithm will zero out defined blocks, ‘alien_file’ method will use given file as a mask, and ‘AutoAlien1’ will use auto mechanism to remove aliens. Each of these algorithms require different parameters
+        aliens : list
+            Needed when the ‘block_aliens’ method is configured. Used when the data contains regions with intensity produced by interference. The regions needs to be zeroed out. The aliens can be defined as regions each defined by coordinates of starting point, and ending point (i.e. [[xb0,yb0,zb0,xe0,ye0,ze0],[xb1,yb1,zb1,xe1,ye1,ze1],…[xbn,ybn,zbn,xen,yen,zen]] ).
+        alien_file : str
+            Needed when the ‘alien_file’ method is configured. User can produce a file in npy format that contains table of zeros and ones, where zero means to set the pixel to zero, and one to leave it.
+        AA1_size_threshold : float
+            Used in the ‘AutoAliens1’ method. If not given it will default to 0.01. The AutoAlien1 algorithm will calculate relative sizes of all clusters with respect to the biggest cluster. The clusters with relative size smaller than the given threshold will be possibly deemed aliens. It also depends on asymmetry.
+        AA1_asym_threshold : float
+            Used in the ‘AutoAliens1’ method. If not given it will default to 1.75. The AutoAlien1 algorithm will calculate average asymmetry of all clusters. The clusters with average asymmetry greater than the given threshold will be possibly deemed aliens. It also depends on relative size.
+        AA1_min_pts : int
+            Used in the ‘AutoAliens1’ method. If not given it will default to 5. Defines minimum non zero points in neighborhood to count the area of data as cluster.
+        AA1_eps : float
+            Used in the ‘AutoAliens1’ method. If not given it will default to 1.1. Used in the clustering algorithm.
+        AA1_amp_threshold : float
+            Mandatory in the ‘AutoAliens1’ method. Used to zero data points below that threshold.
+        AA1_save_arrs : boolean
+            Used in the ‘AutoAliens1’ method, optional. If given and set to True multiple results of alien analysis will be saved in files.
+        AA1_expandcleanedsigma : float
+            Used in the ‘AutoAliens1’ method, optional. If given the algorithm will apply last step of cleaning the data using the configured sigma.
+        intensity_threshold : float
+            Mandatory, min data threshold. Intensity values below this are set to 0. The threshold is applied after removing aliens.
+        adjust_dimensions : list
+            Optional, a list of number to adjust the size at each side of 3D data. If number is positive, the array will be padded. If negative, cropped. The parameters correspond to [x left, x right, y left, y right, z left, z right] The final dimensions will be adjusted up to the good number for the FFT which also is compatible with opencl supported dimensions powers of 2 or a*2^n, where a is 3, 5, or 9
+        center_shift : list
+            Optional, enter center shift list the array maximum is centered before binning, and moved according to center_shift, [0,0,0] has no effect
+        binning : list
+            Optional, a list that defines binning values in respective dimensions, [1,1,1] has no effect.
+        do_auto_binning : boolean
+            Optional, mandatory if auto_data is True. is True the auto binning wil be done, and not otherwise.
+        no_verify : boolean
+            If True, ignores verifier error.
+    """
+
+    if 'alien_alg' in kwargs:
+        data_dir = kwargs.get('data_dir')
+        data = at.remove_aliens(beam_data, kwargs, data_dir)
+    else:
+        data = beam_data
+
+    auto = kwargs.get('auto_data')
+    if auto:
+        # the formula for auto threshold was found empirically, may be
+        # modified in the future if more tests are done
+        auto_threshold_value = 0.141 * beam_data[np.nonzero(beam_data)].mean().item() - 3.062
+        intensity_threshold = auto_threshold_value
+        print(f'auto intensity threshold: {intensity_threshold}')
+    elif 'intensity_threshold' in kwargs:
+        intensity_threshold = kwargs['intensity_threshold']
+    else:
+        print('define amplitude threshold. Exiting')
+        return
+
+    # zero out the noise
+    data = np.where(data <= intensity_threshold, 0.0, data)
+
+    # square root data
+    data = np.sqrt(data)
+
+    if 'adjust_dimensions' in kwargs:
+        crops_pads = kwargs['adjust_dimensions']
+        # the adjust_dimension parameter list holds adjustment in each direction. Append 0s, if shorter
+        if len(crops_pads) < 6:
+            for _ in range(6 - len(crops_pads)):
+                crops_pads.append(0)
+    else:
+        # the size still has to be adjusted to the opencl supported dimension
+        crops_pads = (0, 0, 0, 0, 0, 0)
+    # adjust the size, either pad with 0s or crop array
+    pairs = []
+    for i in range(int(len(crops_pads) / 2)):
+        pair = crops_pads[2 * i:2 * i + 2]
+        pairs.append(pair)
+
+    data = ut.adjust_dimensions(data, pairs)
+    if data is None:
+        print('check "adjust_dimensions" configuration')
+
+    if 'center_shift' in kwargs:
+        center_shift = kwargs['center_shift']
+        data, shift = ut.center_max(data, center_shift)
+    else:
+        data, shift = ut.center_max(data, [0, 0, 0])
+
+    if 'binning' in kwargs:
+        binsizes = kwargs['binning']
+        try:
+            bins = []
+            for binsize in binsizes:
+                bins.append(binsize)
+            filler = len(data.shape) - len(bins)
+            for _ in range(filler):
+                bins.append(1)
+            data = ut.binning(data, bins)
+            kwargs['binning'] = bins
+        except:
+            print('check "binning" configuration')
+
+    # if auto save new config
+    if auto:
+        kwargs['intensity_threshold'] = intensity_threshold
+    return data
